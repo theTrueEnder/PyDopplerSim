@@ -1,80 +1,66 @@
 """
-Baseband IQ Doppler simulator for vehicle-mounted SDR Doppler discrimination.
-
-Geometry: 2D top-down view, vehicles travel along x-axis.
-          Lateral offset 'd' is separation in y-axis.
+Baseband IQ Doppler simulator — full pipeline:
+  geometry → IQ generation → Doppler estimation → r_dot/r_ddot recovery → plots + animation
 
 Coordinate convention:
-  - rx travels in +x direction at v_rx
-  - tx travels in +x direction at v_tx (negative = oncoming)
-  - lateral offset d > 0: tx is in adjacent lane (y = d), rx at y = 0
+  - Both vehicles travel along x-axis
+  - tx_y > 0: lateral lane offset
+  - rx always at y = 0
 """
 
 import numpy as np
 from dataclasses import dataclass
 from typing import Tuple
 import matplotlib
-matplotlib.use("Agg")          # non-interactive backend — write to files
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Scenario configuration
+# Config
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ScenarioConfig:
-    fc:       float = 5.8e9    # carrier frequency [Hz]
-    fs:       float = 1e6      # sample rate [Hz]
-    duration: float = 5.0      # simulation duration [s]
+    fc:       float = 5.8e9
+    fs:       float = 1e6
+    duration: float = 5.0
 
-    tx_x0: float = 100.0       # initial x position of tx [m]
-    tx_y:  float = 3.7         # lateral offset [m]; 0 = co-located
-    tx_vx: float = 30.0        # tx velocity in x [m/s]; negative = oncoming
+    tx_x0: float = 100.0
+    tx_y:  float = 3.7
+    tx_vx: float = 30.0
 
     rx_x0: float = 0.0
     rx_y:  float = 0.0
-    rx_vx: float = 30.0        # rx velocity in x [m/s]
+    rx_vx: float = 30.0
 
-    snr_db:  float = 20.0
-    f_tone:  float = 0.0       # baseband tone offset [Hz]
-
+    snr_db: float = 20.0
+    f_tone: float = 0.0
     interp_oversample: int = 8
 
     def __post_init__(self):
         self.c = 299_792_458.0
 
 
-# ---------------------------------------------------------------------------
-# Scenario factories
-# ---------------------------------------------------------------------------
-
 def scenario_colocated() -> ScenarioConfig:
     cfg = ScenarioConfig()
-    cfg.tx_x0 = cfg.rx_x0
-    cfg.tx_y  = cfg.rx_y
-    cfg.tx_vx = cfg.rx_vx
+    cfg.tx_x0, cfg.tx_y, cfg.tx_vx = cfg.rx_x0, cfg.rx_y, cfg.rx_vx
     cfg.duration = 5.0
     return cfg
 
 def scenario_same_direction() -> ScenarioConfig:
     cfg = ScenarioConfig()
-    cfg.tx_x0 = 50.0
-    cfg.tx_y  = 3.7
-    cfg.tx_vx = 28.0   # 2 m/s slower → slow drift
-    cfg.rx_vx = 30.0
+    cfg.tx_x0, cfg.tx_y, cfg.tx_vx = 50.0, 3.7, 28.0
     cfg.duration = 10.0
     return cfg
 
 def scenario_oncoming() -> ScenarioConfig:
     cfg = ScenarioConfig()
-    cfg.tx_x0 = 300.0
-    cfg.tx_y  = 3.7
-    cfg.tx_vx = -30.0  # head-on
-    cfg.rx_vx = 30.0
-    cfg.duration = 5.0
+    cfg.tx_x0, cfg.tx_y, cfg.tx_vx = 400.0, 3.7, -30.0
+    cfg.duration = 8.0   # CPA at ~t=3.3 s; vehicles well separated before and after
     return cfg
 
 
@@ -83,77 +69,53 @@ def scenario_oncoming() -> ScenarioConfig:
 # ---------------------------------------------------------------------------
 
 def compute_geometry(cfg: ScenarioConfig, t: np.ndarray) -> dict:
-    """
-    Returns a dict with:
-        r       - range [m]
-        r_dot   - radial velocity [m/s]  (+ve = moving apart)
-        r_ddot  - radial acceleration [m/s²]
-        delta_f - Doppler shift [Hz]
-        tx_x, tx_y, rx_x, rx_y - positions for trajectory plots
-    """
     tx_x = cfg.tx_x0 + cfg.tx_vx * t
     rx_x = cfg.rx_x0 + cfg.rx_vx * t
 
     dx   = tx_x - rx_x
-    dy   = cfg.tx_y - cfg.rx_y   # constant (straight road, no lateral motion)
+    dy   = cfg.tx_y - cfg.rx_y   # constant
     r    = np.sqrt(dx**2 + dy**2)
-
-    vdx  = cfg.tx_vx - cfg.rx_vx
-    # vdy = 0  (no lateral motion)
-
     safe_r = np.where(r < 1e-6, 1e-6, r)
 
-    # r_dot = (dx*vdx) / r
+    vdx    = cfg.tx_vx - cfg.rx_vx
     r_dot  = (dx * vdx) / safe_r
-
-    # r_ddot = d/dt [ (dx*vdx) / r ]
-    #        = (vdx² * r  -  dx*vdx * r_dot) / r²
-    #   (using quotient rule; vdx is constant, d(dx)/dt = vdx)
     r_ddot = (vdx**2 * safe_r - dx * vdx * r_dot) / safe_r**2
 
-    delta_f = -r_dot * cfg.fc / cfg.c
+    # LoS unit vector angle (for polar plot): angle of (tx - rx) in world frame
+    los_angle = np.arctan2(dy, dx)   # scalar dy is fine; dx varies
 
     return dict(
         r=r, r_dot=r_dot, r_ddot=r_ddot,
-        delta_f=delta_f,
+        delta_f=-r_dot * cfg.fc / cfg.c,
         tx_x=tx_x, rx_x=rx_x,
         tx_y=np.full_like(t, cfg.tx_y),
         rx_y=np.full_like(t, cfg.rx_y),
+        los_angle=los_angle,
     )
 
 
 # ---------------------------------------------------------------------------
-# IQ signal generation
+# IQ generation
 # ---------------------------------------------------------------------------
 
 def generate_iq(cfg: ScenarioConfig) -> dict:
-    """
-    Phase is computed by integrating instantaneous frequency on a fine grid
-    (oversampled × interp_oversample) then decimated to fs.
-
-    φ(t) = 2π ∫₀ᵗ [f_tone + Δf(τ)] dτ
-    """
     N_fine  = int(cfg.duration * cfg.fs * cfg.interp_oversample)
     t_fine  = np.linspace(0, cfg.duration, N_fine, endpoint=False)
     dt_fine = t_fine[1] - t_fine[0]
 
-    geo_fine = compute_geometry(cfg, t_fine)
+    geo_fine  = compute_geometry(cfg, t_fine)
     inst_freq = cfg.f_tone + geo_fine["delta_f"]
+    phase     = 2 * np.pi * np.cumsum(inst_freq) * dt_fine
+    iq_fine   = np.exp(1j * phase)
 
-    phase    = 2 * np.pi * np.cumsum(inst_freq) * dt_fine
-    iq_fine  = np.exp(1j * phase)
-
-    # Decimate
-    iq   = iq_fine[::cfg.interp_oversample]
-    t    = t_fine[::cfg.interp_oversample]
-    N    = len(iq)
-
-    geo  = compute_geometry(cfg, t)
+    iq  = iq_fine[::cfg.interp_oversample]
+    t   = t_fine[::cfg.interp_oversample]
 
     snr_lin   = 10 ** (cfg.snr_db / 10)
     noise_std = np.sqrt(1 / (2 * snr_lin))
-    noise     = noise_std * (np.random.randn(N) + 1j * np.random.randn(N))
+    noise     = noise_std * (np.random.randn(len(iq)) + 1j * np.random.randn(len(iq)))
 
+    geo = compute_geometry(cfg, t)
     return dict(t=t, iq=iq + noise, iq_clean=iq, cfg=cfg, **geo)
 
 
@@ -161,191 +123,354 @@ def generate_iq(cfg: ScenarioConfig) -> dict:
 # Doppler estimators
 # ---------------------------------------------------------------------------
 
-def estimate_doppler_stft(
-    iq: np.ndarray,
-    fs: float,
-    window_dur: float = 0.05,   # 50 ms → freq resolution 20 Hz
-    hop_dur:    float = 0.005,
-    freq_zoom:  float = 5000.0, # display ± this many Hz
-) -> dict:
+def _hann_smooth(x: np.ndarray, w: int) -> np.ndarray:
+    if w < 2:
+        return x
+    h = np.hanning(w); h /= h.sum()
+    return np.convolve(x, h, mode='same')
+
+
+def estimate_doppler_phase_diff(iq, fs, smooth_window=501):
+    """FM discriminator → instantaneous Δf [Hz]"""
+    f_inst = np.angle(iq[1:] * np.conj(iq[:-1])) / (2 * np.pi) * fs
+    f_inst = _hann_smooth(f_inst, smooth_window)
+    t = np.arange(len(f_inst)) / fs
+    return t, f_inst
+
+
+def estimate_doppler_stft(iq, fs, window_dur=0.05, hop_dur=0.005, freq_zoom=5000.0):
     win_samp = int(window_dur * fs)
     hop_samp = int(hop_dur * fs)
-    # Zero-pad to 4× window for smoother peak interpolation
     N_fft    = win_samp * 4
     win      = np.hanning(win_samp)
-
     n_frames = (len(iq) - win_samp) // hop_samp + 1
-    Sxx      = np.zeros((N_fft, n_frames))
 
+    Sxx = np.zeros((N_fft, n_frames))
     for i in range(n_frames):
-        seg       = iq[i*hop_samp : i*hop_samp + win_samp] * win
+        seg = iq[i*hop_samp : i*hop_samp + win_samp] * win
         Sxx[:, i] = np.abs(np.fft.fftshift(np.fft.fft(seg, N_fft)))**2
 
     freq_axis = np.fft.fftshift(np.fft.fftfreq(N_fft, 1/fs))
     t_stft    = (np.arange(n_frames) * hop_samp + win_samp // 2) / fs
     peak_freq = freq_axis[np.argmax(Sxx, axis=0)]
-
-    # Zoom mask for display
     mask      = np.abs(freq_axis) <= freq_zoom
-
-    return dict(
-        t=t_stft,
-        freq_axis=freq_axis,
-        Sxx=Sxx,
-        peak_freq=peak_freq,
-        mask=mask,
-    )
+    return dict(t=t_stft, freq_axis=freq_axis, Sxx=Sxx, peak_freq=peak_freq, mask=mask)
 
 
-def estimate_doppler_phase_diff(
-    iq: np.ndarray,
-    fs: float,
+# ---------------------------------------------------------------------------
+# Kinematic recovery from estimated Δf
+# ---------------------------------------------------------------------------
+
+def recover_kinematics(
+    t_est: np.ndarray,
+    delta_f_est: np.ndarray,
+    fc: float,
+    c: float,
     smooth_window: int = 501,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """FM discriminator: f_inst[n] = angle(iq[n] * conj(iq[n-1])) * fs / 2π"""
-    lag1   = iq[1:] * np.conj(iq[:-1])
-    f_inst = np.angle(lag1) / (2 * np.pi) * fs
-    if smooth_window > 1:
-        h      = np.hanning(smooth_window)
-        h     /= h.sum()
-        f_inst = np.convolve(f_inst, h, mode='same')
-    return np.arange(len(f_inst)) / fs, f_inst
+) -> dict:
+    """
+    Invert Doppler equation to get estimated r_dot, then numerically
+    differentiate with smoothing to get r_ddot.
+
+        r_dot_est  = -Δf_est * c / fc
+        r_ddot_est = d(r_dot_est)/dt  ← finite-difference + Hann smoothing
+
+    The double-smoothing (once on Δf, once on r_ddot) is intentional:
+    differentiation is a high-pass operation that amplifies noise, so
+    the second smooth keeps r_ddot usable for classification.
+    """
+    r_dot_est  = -delta_f_est * c / fc
+
+    # Central-difference derivative; edges use forward/backward diff
+    dt        = np.diff(t_est)
+    dr        = np.diff(r_dot_est)
+    r_ddot_raw = dr / dt                          # length N-1
+    # Pad to same length as r_dot_est using edge values
+    r_ddot_raw = np.concatenate([[r_ddot_raw[0]], r_ddot_raw])
+    r_ddot_est = _hann_smooth(r_ddot_raw, smooth_window)
+
+    return dict(r_dot=r_dot_est, r_ddot=r_ddot_est)
 
 
 # ---------------------------------------------------------------------------
-# Plotting
+# Plotting helpers
 # ---------------------------------------------------------------------------
 
-COLORS = dict(gt='black', pd='steelblue', stft='tomato', tx='orange', rx='royalblue')
+COLORS = dict(gt='black', pd='steelblue', stft='tomato', tx='darkorange', rx='royalblue')
 
 
-def plot_trajectory(result: dict, ax_2d: plt.Axes, ax_range: plt.Axes):
-    """2-D top-down trajectory + range vs time."""
-    cfg  = result["cfg"]
-    t    = result["t"]
+def plot_trajectory_fig(result, out_path):
+    cfg = result["cfg"]
+    t   = result["t"]
+    fig, (ax_2d, ax_r) = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle(f"{result['scenario_name']} — Trajectory", fontweight='bold')
 
-    tx_x, tx_y = result["tx_x"], result["tx_y"]
-    rx_x, rx_y = result["rx_x"], result["rx_y"]
-
-    # 2-D trajectory
-    ax_2d.plot(tx_x, tx_y, color=COLORS["tx"], lw=2, label="Tx")
-    ax_2d.plot(rx_x, rx_y, color=COLORS["rx"], lw=2, label="Rx")
-
-    # Mark start/end with arrows
-    for xs, ys, col in [(tx_x, tx_y, COLORS["tx"]), (rx_x, ry := rx_y, COLORS["rx"])]:
-        ax_2d.annotate("", xy=(xs[len(xs)//2 + 5], ys[len(ys)//2 + 5]),
-                       xytext=(xs[len(xs)//2], ys[len(ys)//2]),
+    ax_2d.plot(result["tx_x"], result["tx_y"], color=COLORS["tx"], lw=2, label="Tx")
+    ax_2d.plot(result["rx_x"], result["rx_y"], color=COLORS["rx"], lw=2, label="Rx")
+    for xs, ys, col in [(result["tx_x"], result["tx_y"], COLORS["tx"]),
+                        (result["rx_x"], result["rx_y"], COLORS["rx"])]:
+        mid = len(xs) // 2
+        ax_2d.annotate("", xy=(xs[mid+5], ys[mid+5]), xytext=(xs[mid], ys[mid]),
                        arrowprops=dict(arrowstyle="->", color=col, lw=1.5))
-    ax_2d.scatter([tx_x[0], rx_x[0]], [tx_y[0], rx_y[0]], s=60, zorder=5,
-                  color=[COLORS["tx"], COLORS["rx"]], marker='o')
-    ax_2d.scatter([tx_x[-1], rx_x[-1]], [tx_y[-1], rx_y[-1]], s=60, zorder=5,
-                  color=[COLORS["tx"], COLORS["rx"]], marker='s')
-    ax_2d.set_xlabel("x position [m]")
-    ax_2d.set_ylabel("y position [m]")
-    ax_2d.set_title("2-D Trajectory (top-down)")
-    ax_2d.legend(fontsize=8)
-    ax_2d.grid(True, alpha=0.4)
+    ax_2d.scatter([result["tx_x"][0], result["rx_x"][0]],
+                  [result["tx_y"][0], result["rx_y"][0]],
+                  color=[COLORS["tx"], COLORS["rx"]], s=60, zorder=5, marker='o')
+    ax_2d.set_xlabel("x [m]"); ax_2d.set_ylabel("y [m]")
+    ax_2d.set_title("2-D trajectory (top-down)")
+    ax_2d.legend(fontsize=8); ax_2d.grid(True, alpha=0.4)
     ax_2d.set_aspect('equal', adjustable='datalim')
 
-    # Range
-    ax_range.plot(t, result["r"], color='purple', lw=1.5)
-    ax_range.set_xlabel("Time [s]")
-    ax_range.set_ylabel("Range r(t) [m]")
-    ax_range.set_title("Range over time")
-    ax_range.grid(True, alpha=0.4)
+    ax_r.plot(t, result["r"], color='purple', lw=1.5)
+    ax_r.set_xlabel("Time [s]"); ax_r.set_ylabel("Range r(t) [m]")
+    ax_r.set_title("Range over time"); ax_r.grid(True, alpha=0.4)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
-def plot_rdot_rddot(result: dict, ax_rd: plt.Axes, ax_rdd: plt.Axes):
-    t      = result["t"]
-    r_dot  = result["r_dot"]
-    r_ddot = result["r_ddot"]
+def plot_rdot_rddot_fig(result, est_pd, out_path):
+    """Plot ground-truth AND estimated r_dot / r_ddot from phase-diff."""
+    t   = result["t"]
+    cfg = result["cfg"]
 
-    ax_rd.plot(t, r_dot, color=COLORS["gt"], lw=1.5)
-    ax_rd.axhline(0, color='gray', lw=0.8, ls='--')
-    ax_rd.set_ylabel("ṙ [m/s]")
-    ax_rd.set_title("Radial velocity ṙ(t)  [+ = moving apart]")
-    ax_rd.grid(True, alpha=0.4)
+    # Recover kinematics from phase-diff estimate
+    kin = recover_kinematics(est_pd["t"], est_pd["delta_f"], cfg.fc, cfg.c)
 
-    ax_rdd.plot(t, r_ddot, color='darkgreen', lw=1.5)
-    ax_rdd.axhline(0, color='gray', lw=0.8, ls='--')
-    ax_rdd.set_ylabel("r̈ [m/s²]")
-    ax_rdd.set_xlabel("Time [s]")
-    ax_rdd.set_title("Radial acceleration r̈(t)  [peak at CPA]")
-    ax_rdd.grid(True, alpha=0.4)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    fig.suptitle(f"{result['scenario_name']} — Radial kinematics", fontweight='bold')
+
+    ax = axes[0]
+    ax.plot(t, result["r_dot"], color=COLORS["gt"], lw=1.8, label='Ground truth ṙ')
+    ax.plot(kin["t"] if "t" in kin else est_pd["t"], kin["r_dot"],
+            color=COLORS["pd"], lw=1.0, alpha=0.85, label='Estimated ṙ (phase-diff)')
+    ax.axhline(0, color='gray', lw=0.8, ls='--')
+    ax.set_ylabel("ṙ [m/s]"); ax.set_title("Radial velocity ṙ(t)")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
+
+    ax = axes[1]
+    ax.plot(t, result["r_ddot"], color=COLORS["gt"], lw=1.8, label='Ground truth r̈')
+    ax.plot(est_pd["t"], kin["r_ddot"],
+            color=COLORS["pd"], lw=1.0, alpha=0.85, label='Estimated r̈ (phase-diff)')
+    ax.axhline(0, color='gray', lw=0.8, ls='--')
+    ax.set_ylabel("r̈ [m/s²]"); ax.set_xlabel("Time [s]")
+    ax.set_title("Radial acceleration r̈(t)  [peak at CPA]")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
-def plot_doppler_estimates(result: dict, ax_pd: plt.Axes, ax_stft: plt.Axes):
+def plot_doppler_fig(result, est_pd, out_path):
     cfg = result["cfg"]
     t   = result["t"]
     gt  = result["delta_f"]
+    zoom = max(500.0, 3.0 * np.abs(gt).max())
 
-    # Phase-diff
-    t_pd, f_pd = estimate_doppler_phase_diff(result["iq"], cfg.fs)
-    ax_pd.plot(t_pd, f_pd, color=COLORS["pd"], lw=0.8, alpha=0.85, label='Phase-diff')
+    stft = estimate_doppler_stft(result["iq"], cfg.fs, freq_zoom=zoom)
+
+    fig, (ax_pd, ax_stft) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig.suptitle(f"{result['scenario_name']} — Doppler estimation", fontweight='bold')
+
+    ax_pd.plot(est_pd["t"], est_pd["delta_f"], color=COLORS["pd"],
+               lw=0.8, alpha=0.85, label='Phase-diff Δf')
     ax_pd.plot(t, gt, color=COLORS["gt"], lw=1.5, ls='--', label='Ground truth')
     ax_pd.set_ylabel("Δf [Hz]")
     ax_pd.set_title("Instantaneous frequency — phase differentiation")
-    ax_pd.legend(fontsize=8)
-    ax_pd.grid(True, alpha=0.4)
+    ax_pd.legend(fontsize=8); ax_pd.grid(True, alpha=0.4)
 
-    # STFT spectrogram (zoomed)
-    # Auto zoom: use 3× the max ground-truth |Δf| or minimum 500 Hz
-    zoom = max(500.0, 3.0 * np.abs(gt).max())
-    stft = estimate_doppler_stft(result["iq"], cfg.fs, freq_zoom=zoom)
-
-    mask    = stft["mask"]
-    f_zoom  = stft["freq_axis"][mask]
-    Sxx_dB  = 10 * np.log10(stft["Sxx"][mask, :] + 1e-12)
-    vmin    = np.percentile(Sxx_dB, 20)
-
-    extent  = [stft["t"][0], stft["t"][-1], f_zoom[0], f_zoom[-1]]
-    ax_stft.imshow(Sxx_dB, aspect='auto', origin='lower',
-                   extent=extent, cmap='inferno', vmin=vmin)
-    ax_stft.plot(stft["t"], stft["peak_freq"], color='cyan', lw=1.0,
-                 ls='--', label='STFT peak')
+    mask   = stft["mask"]
+    f_zoom = stft["freq_axis"][mask]
+    Sxx_dB = 10 * np.log10(stft["Sxx"][mask, :] + 1e-12)
+    extent = [stft["t"][0], stft["t"][-1], f_zoom[0], f_zoom[-1]]
+    ax_stft.imshow(Sxx_dB, aspect='auto', origin='lower', extent=extent,
+                   cmap='inferno', vmin=np.percentile(Sxx_dB, 20))
+    ax_stft.plot(stft["t"], stft["peak_freq"], color='cyan', lw=1.0, ls='--', label='STFT peak')
     ax_stft.plot(t, gt, color='white', lw=1.5, ls='--', label='Ground truth')
-    ax_stft.set_ylabel("Δf [Hz]")
-    ax_stft.set_xlabel("Time [s]")
+    ax_stft.set_ylabel("Δf [Hz]"); ax_stft.set_xlabel("Time [s]")
     ax_stft.set_title(f"STFT spectrogram (zoomed ±{zoom:.0f} Hz)")
     ax_stft.legend(fontsize=8, loc='upper right')
 
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
-def save_all_plots(result: dict, scenario_name: str, out_root: str = "plots"):
+
+# ---------------------------------------------------------------------------
+# Animation
+# ---------------------------------------------------------------------------
+
+def make_animation(result: dict, out_path: Path, fps: int = 20, n_frames: int = 200):
     """
-    Saves three figures per scenario into plots/<scenario_name>/:
-      1. trajectory.png   - 2D top-down path + range
-      2. rdot_rddot.png   - radial velocity & acceleration
-      3. doppler.png      - phase-diff estimate + STFT spectrogram
+    Two-panel animation:
+      Left : 2-D top-down position of Tx and Rx over time
+      Right: Polar plot — ground-truth LoS vector (black) and
+             estimated LoS angle recovered from phase-diff r_dot (blue).
+
+    Estimating the LoS *angle* from r_dot alone is underdetermined (r_dot = |v_rel| cos θ,
+    but we don't know |v_rel| from the receiver's perspective in a blind scenario).
+    Here we take a semi-blind approach: the receiver knows its own velocity (GPS/IMU)
+    and fc, so it computes r_dot_est from Δf_est. We then show r_dot_est as the
+    *radial component* on the polar plot (radius = |r_dot|, angle = estimated LoS),
+    where the estimated LoS angle is recovered via:
+        cos(θ) = r_dot_est / |v_rel_assumed|
+    using v_rel_assumed = rx_vx (self-velocity, known from GPS) as a lower bound.
+    This makes the polar plot physically interpretable.
     """
-    slug = scenario_name.lower().replace(" ", "_").replace("-", "_")
+    cfg = result["cfg"]
+    t   = result["t"]
+    N   = len(t)
+
+    # Subsample to n_frames
+    idx    = np.linspace(0, N - 1, n_frames, dtype=int)
+    t_anim = t[idx]
+
+    # Ground-truth quantities at animation frames
+    tx_x_a = result["tx_x"][idx]
+    tx_y_a = result["tx_y"][idx]
+    rx_x_a = result["rx_x"][idx]
+    rx_y_a = result["rx_y"][idx]
+    los_a  = result["los_angle"][idx]       # ground-truth LoS angle
+    r_a    = result["r"][idx]
+    r_dot_a = result["r_dot"][idx]
+
+    # Estimated r_dot from phase-diff (interpolate to animation frames)
+    t_pd, delta_f_pd = estimate_doppler_phase_diff(result["iq"], cfg.fs)
+    r_dot_pd_full = -delta_f_pd * cfg.c / cfg.fc
+    r_dot_pd_a    = np.interp(t_anim, t_pd, r_dot_pd_full)
+
+    # Estimated LoS angle: cos(θ) = r_dot / v_rel_x, clipped to [-1, 1]
+    # v_rel_x is not known blind, but Rx knows its own speed (GPS).
+    # We use rx_vx as the reference — gives the "minimum angle" estimate.
+    v_ref = abs(cfg.rx_vx) if abs(cfg.rx_vx) > 1.0 else 1.0
+    cos_theta_est = np.clip(r_dot_pd_a / v_ref, -1.0, 1.0)
+    # Sign of dy determines which half-plane: use ground truth dy sign (known from lane model)
+    los_est_a = np.arccos(cos_theta_est) * np.sign(cfg.tx_y - cfg.rx_y + 1e-9)
+
+    # ---- Figure layout ----
+    fig = plt.figure(figsize=(11, 5))
+    fig.patch.set_facecolor('#1a1a2e')
+    gs   = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1.6, 1])
+
+    ax2d  = fig.add_subplot(gs[0])
+    ax_pol = fig.add_subplot(gs[1], projection='polar')
+
+    for ax in [ax2d]:
+        ax.set_facecolor('#16213e')
+        for sp in ax.spines.values():
+            sp.set_edgecolor('#444')
+    ax_pol.set_facecolor('#16213e')
+
+    # 2-D axes limits (fixed)
+    all_x = np.concatenate([result["tx_x"], result["rx_x"]])
+    pad_x = (all_x.max() - all_x.min()) * 0.05
+    x_min, x_max = all_x.min() - pad_x, all_x.max() + pad_x
+    y_vals = [cfg.tx_y, cfg.rx_y]
+    y_min  = min(y_vals) - 10
+    y_max  = max(y_vals) + 10
+
+    ax2d.set_xlim(x_min, x_max)
+    ax2d.set_ylim(y_min, y_max)
+    ax2d.set_xlabel("x [m]", color='white'); ax2d.set_ylabel("y [m]", color='white')
+    ax2d.tick_params(colors='white'); ax2d.grid(True, alpha=0.25, color='#555')
+    ax2d.set_title("Vehicle positions", color='white', fontsize=10)
+
+    # Polar axes
+    ax_pol.set_theta_zero_location('E')
+    ax_pol.set_theta_direction(1)
+    ax_pol.tick_params(colors='#aaa')
+    ax_pol.yaxis.label.set_color('white')
+    ax_pol.set_title("LoS direction\n(from Rx toward Tx)", color='white', fontsize=9, pad=12)
+    r_max_pol = r_a.max() * 1.1
+    ax_pol.set_ylim(0, r_max_pol)
+    ax_pol.set_rlabel_position(45)
+
+    # Static full-path traces (faint)
+    ax2d.plot(result["tx_x"], result["tx_y"], color=COLORS["tx"], alpha=0.15, lw=1)
+    ax2d.plot(result["rx_x"], result["rx_y"], color=COLORS["rx"], alpha=0.15, lw=1)
+
+    # Animated artists — 2D
+    trail_len = max(5, n_frames // 20)
+    tx_trail,  = ax2d.plot([], [], color=COLORS["tx"], lw=1.5, alpha=0.6)
+    rx_trail,  = ax2d.plot([], [], color=COLORS["rx"], lw=1.5, alpha=0.6)
+    tx_dot,    = ax2d.plot([], [], 'o', color=COLORS["tx"], ms=9, label='Tx', zorder=5)
+    rx_dot,    = ax2d.plot([], [], 'o', color=COLORS["rx"], ms=9, label='Rx', zorder=5)
+    los_line,  = ax2d.plot([], [], '--', color='white', lw=0.8, alpha=0.6)
+    time_txt   = ax2d.text(0.02, 0.95, '', transform=ax2d.transAxes,
+                           color='white', fontsize=9, va='top')
+    ax2d.legend(fontsize=8, facecolor='#222', labelcolor='white', loc='lower right')
+
+    # Animated artists — polar
+    pol_gt,  = ax_pol.plot([], [], '-o', color=COLORS["gt"], ms=5, lw=1.5, label='GT LoS')
+    pol_est, = ax_pol.plot([], [], '-o', color=COLORS["pd"], ms=5, lw=1.5, alpha=0.8, label='Est. LoS')
+    ax_pol.legend(fontsize=7, facecolor='#222', labelcolor='white',
+                  loc='lower left', bbox_to_anchor=(-0.15, -0.12))
+
+    def init():
+        for artist in [tx_trail, rx_trail, tx_dot, rx_dot, los_line, pol_gt, pol_est]:
+            artist.set_data([], [])
+        time_txt.set_text('')
+        return tx_trail, rx_trail, tx_dot, rx_dot, los_line, pol_gt, pol_est, time_txt
+
+    def update(i):
+        sl = slice(max(0, i - trail_len), i + 1)
+
+        tx_trail.set_data(tx_x_a[sl], tx_y_a[sl])
+        rx_trail.set_data(rx_x_a[sl], rx_y_a[sl])
+        tx_dot.set_data([tx_x_a[i]], [tx_y_a[i]])
+        rx_dot.set_data([rx_x_a[i]], [rx_y_a[i]])
+        los_line.set_data([rx_x_a[i], tx_x_a[i]], [rx_y_a[i], tx_y_a[i]])
+        time_txt.set_text(f"t = {t_anim[i]:.2f} s")
+
+        # Polar: plot from origin (0,0) to (los_angle, r)
+        pol_gt.set_data([los_a[i]], [r_a[i]])
+        pol_est.set_data([los_est_a[i]], [r_a[i]])   # same r — only angle differs
+
+        return tx_trail, rx_trail, tx_dot, rx_dot, los_line, pol_gt, pol_est, time_txt
+
+    anim = FuncAnimation(fig, update, frames=n_frames, init_func=init,
+                         blit=True, interval=1000 / fps)
+
+    # Try MP4 first, fall back to GIF
+    try:
+        writer = FFMpegWriter(fps=fps, metadata=dict(title=result["scenario_name"]))
+        anim.save(str(out_path.with_suffix(".mp4")), writer=writer, dpi=120,
+                  savefig_kwargs=dict(facecolor=fig.get_facecolor()))
+        print(f"    Animation → {out_path.with_suffix('.mp4')}")
+    except Exception as e:
+        print(f"    ffmpeg unavailable ({e}), falling back to GIF...")
+        writer = PillowWriter(fps=fps)
+        anim.save(str(out_path.with_suffix(".gif")), writer=writer, dpi=100,
+                  savefig_kwargs=dict(facecolor=fig.get_facecolor()))
+        print(f"    Animation → {out_path.with_suffix('.gif')}")
+
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Save all outputs
+# ---------------------------------------------------------------------------
+
+def save_all(result: dict, out_root: str = "plots"):
+    name  = result["scenario_name"]
+    slug  = name.lower().replace(" ", "_").replace("-", "_")
     out_dir = Path(out_root) / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Figure 1: Trajectory ---
-    fig, (ax_2d, ax_r) = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle(f"{scenario_name} — Trajectory", fontweight='bold')
-    plot_trajectory(result, ax_2d, ax_r)
-    plt.tight_layout()
-    fig.savefig(out_dir / "trajectory.png", dpi=150)
-    plt.close(fig)
+    cfg = result["cfg"]
+    t_pd, delta_f_pd = estimate_doppler_phase_diff(result["iq"], cfg.fs)
+    est_pd = {"t": t_pd, "delta_f": delta_f_pd}
 
-    # --- Figure 2: ṙ and r̈ ---
-    fig, (ax_rd, ax_rdd) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    fig.suptitle(f"{scenario_name} — Radial kinematics", fontweight='bold')
-    plot_rdot_rddot(result, ax_rd, ax_rdd)
-    plt.tight_layout()
-    fig.savefig(out_dir / "rdot_rddot.png", dpi=150)
-    plt.close(fig)
+    print(f"  Saving static plots...")
+    plot_trajectory_fig(result, out_dir / "trajectory.png")
+    plot_rdot_rddot_fig(result, est_pd, out_dir / "rdot_rddot.png")
+    plot_doppler_fig(result, est_pd, out_dir / "doppler.png")
 
-    # --- Figure 3: Doppler estimates ---
-    fig, (ax_pd, ax_stft) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    fig.suptitle(f"{scenario_name} — Doppler estimation", fontweight='bold')
-    plot_doppler_estimates(result, ax_pd, ax_stft)
-    plt.tight_layout()
-    fig.savefig(out_dir / "doppler.png", dpi=150)
-    plt.close(fig)
+    print(f"  Rendering animation...")
+    make_animation(result, out_dir / "animation")
 
-    print(f"  Saved plots → {out_dir}\\")
+    print(f"  All outputs → {out_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +489,9 @@ if __name__ == "__main__":
     for name, cfg in scenarios:
         print(f"\n=== {name} ===")
         result = generate_iq(cfg)
-        print(f"  Duration:     {cfg.duration:.1f} s  ({len(result['iq']):,} samples @ {cfg.fs/1e6:.1f} MHz)")
-        print(f"  Δf range:     [{result['delta_f'].min():.2f}, {result['delta_f'].max():.2f}] Hz")
-        print(f"  r̈ peak:       {np.abs(result['r_ddot']).max():.4f} m/s²")
-        print(f"  Range min:    {result['r'].min():.1f} m  (CPA)")
-        save_all_plots(result, name)
+        result["scenario_name"] = name
+        print(f"  Duration:   {cfg.duration:.1f} s  ({len(result['iq']):,} samples)")
+        print(f"  Δf range:   [{result['delta_f'].min():.2f}, {result['delta_f'].max():.2f}] Hz")
+        print(f"  r̈ peak:     {np.abs(result['r_ddot']).max():.4f} m/s²")
+        print(f"  Range CPA:  {result['r'].min():.1f} m")
+        save_all(result, "plots")
