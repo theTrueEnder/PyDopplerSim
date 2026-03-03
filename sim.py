@@ -12,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
+from matplotlib.animation import FFMpegWriter, PillowWriter
 from pathlib import Path
 
 
@@ -20,13 +20,16 @@ from pathlib import Path
 # ★  TOP-LEVEL CONFIG — edit this block
 # =============================================================================
 
-
 class SimConfig:
     # ---------- rendering ------------------------------------------------
-    RENDER_ANIMATION   = False
-    ANIMATION_FPS      = 20
+    RENDER_ANIMATION   = True
+    # Set to None to rely on PATH, or provide the full path to ffmpeg.exe
+    # e.g. r"C:\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"
+    FFMPEG_PATH: str | None = None
+    
+    ANIMATION_FPS      = 10 # 20
     ANIMATION_N_FRAMES = 100
-    ANIMATION_DPI_MP4  = 120
+    ANIMATION_DPI_MP4  = 80 # 120
     ANIMATION_DPI_GIF  = 80
 
     # ---------- RF / sampling --------------------------------------------
@@ -66,6 +69,11 @@ class SimConfig:
 # =============================================================================
 # Scenario config
 # =============================================================================
+
+# Apply ffmpeg path override before any animation code runs
+if SimConfig.FFMPEG_PATH:
+    matplotlib.rcParams['animation.ffmpeg_path'] = SimConfig.FFMPEG_PATH
+
 
 @dataclass
 class ScenarioConfig:
@@ -178,51 +186,64 @@ def estimate_doppler_stft(iq, fs, window_dur=None, hop_dur=None, freq_zoom=5000.
 
 def recover_kinematics(t_est, delta_f_est, fc, c):
     """
-    r_dot  : invert Doppler equation directly.
-    r_ddot : decimate r_dot to RDOT_DECIM_HZ before differentiating.
+    r_dot  : invert Doppler equation directly at full sample rate.
+    r_ddot : decimate r_dot to RDOT_DECIM_HZ *before* differentiating.
 
     Why decimate first?
     -------------------
-    Finite-difference amplifies noise by 1/dt.  At fs=1 MHz, dt=1µs, so even
-    1 m/s of noise on r_dot becomes ~1e6 m/s² after differencing.  Decimating
-    to 100 Hz first makes dt=10 ms, reducing that amplification by 10,000×.
-    The Doppler trajectory changes on timescales of ~0.1–1 s, so 100 Hz is
-    more than sufficient to resolve the CPA peak in r_ddot.
+    Finite-difference amplifies noise by 1/dt. At fs=1 MHz, dt=1µs, so even
+    1 m/s of r_dot noise becomes ~1e6 m/s² after one difference step.
+    Decimating to 100 Hz makes dt=10 ms, cutting amplification by 10,000×.
+    Doppler trajectories change on 0.1–1 s timescales so 100 Hz is sufficient.
+
+    NaN handling
+    ------------
+    The Hann smoother zero-pads edges, producing artifacts in the first and
+    last sw_pd//2 samples of r_dot. We mark those NaN, then build the
+    decimated grid from *only* fully-valid (all-finite) bins so that no
+    NaN bleeds through nanmean into the differentiation step.
     """
+    sw_pd    = SimConfig.PD_SMOOTH_WINDOW
     decim_hz = SimConfig.RDOT_DECIM_HZ
     sw_ddot  = SimConfig.RDOT_SMOOTH_WINDOW
-    sw_pd    = SimConfig.PD_SMOOTH_WINDOW
 
     r_dot_full = -delta_f_est * c / fc
 
-    # Trim phase-diff edge artifacts (zero-padding transient from Hann convolution)
+    # Mark smoother edge artifacts as NaN
     trim = sw_pd // 2
     r_dot_full[:trim]  = np.nan
     r_dot_full[-trim:] = np.nan
 
-    # Decimate: average into bins of width fs/decim_hz
+    # Decimate: only keep bins where ALL samples are finite
     fs_orig    = 1.0 / (t_est[1] - t_est[0])
     decim_step = max(1, int(round(fs_orig / decim_hz)))
-    # Use nanmean over each bin to handle NaN-trimmed edges gracefully
-    n_bins  = len(r_dot_full) // decim_step
-    r_dot_d = np.array([np.nanmean(r_dot_full[i*decim_step:(i+1)*decim_step])
-                        for i in range(n_bins)])
-    t_d     = np.array([np.nanmean(t_est[i*decim_step:(i+1)*decim_step])
-                        for i in range(n_bins)])
+    n_bins     = len(r_dot_full) // decim_step
 
-    # Differentiate at decimated rate
+    t_d_list     = []
+    r_dot_d_list = []
+    for i in range(n_bins):
+        sl  = slice(i * decim_step, (i + 1) * decim_step)
+        seg = r_dot_full[sl]
+        if np.all(np.isfinite(seg)):                 # skip any bin touching NaN edge
+            t_d_list.append(t_est[sl].mean())
+            r_dot_d_list.append(seg.mean())
+
+    t_d     = np.array(t_d_list)
+    r_dot_d = np.array(r_dot_d_list)
+
+    # Differentiate on the clean, uniformly-spaced decimated grid
     dt_d       = np.diff(t_d)
     r_ddot_raw = np.concatenate([[np.nan], np.diff(r_dot_d) / dt_d])
     r_ddot_d   = _hann_smooth(r_ddot_raw, sw_ddot)
 
-    # Trim ddot edges too
+    # Trim ddot smoother edges
     trim_d = sw_ddot // 2
     r_ddot_d[:trim_d]  = np.nan
     r_ddot_d[-trim_d:] = np.nan
 
     return dict(
-        t_dot=t_est,  r_dot=r_dot_full,   # full-rate r_dot (with NaN edges)
-        t_ddot=t_d,   r_ddot=r_ddot_d,    # decimated r_ddot
+        t_dot=t_est,  r_dot=r_dot_full,
+        t_ddot=t_d,   r_ddot=r_ddot_d,
     )
 
 
@@ -353,35 +374,41 @@ def plot_doppler_fig(result, est_pd, out_path):
 # =============================================================================
 
 def make_animation(result: dict, out_path: Path):
+    """
+    Render animation by driving the writer directly in a for-loop rather than
+    using FuncAnimation. This avoids FuncAnimation's per-frame figure-diffing
+    overhead and lets us pre-compute all frame data as numpy arrays upfront so
+    zero numpy work happens inside the render loop.
+
+    Speed levers (all in SimConfig):
+      ANIMATION_N_FRAMES  — fewer frames = linearly faster
+      ANIMATION_DPI_*     — lower DPI = quadratically faster (pixel count)
+      ANIMATION_FPS       — only affects playback speed, not render time
+    """
     C   = C_DARK
     fps = SimConfig.ANIMATION_FPS
     n_f = SimConfig.ANIMATION_N_FRAMES
     cfg = result["cfg"]
     t   = result["t"]
 
+    # ---- Pre-compute ALL per-frame data as arrays -------------------------
     idx    = np.linspace(0, len(t) - 1, n_f, dtype=int)
     t_anim = t[idx]
-
-    tx_x_a = result["tx_x"][idx]; tx_y_a = result["tx_y"][idx]
-    rx_x_a = result["rx_x"][idx]; rx_y_a = result["rx_y"][idx]
+    tx_x_a = result["tx_x"][idx];  tx_y_a = result["tx_y"][idx]
+    rx_x_a = result["rx_x"][idx];  rx_y_a = result["rx_y"][idx]
     los_a  = result["los_angle"][idx]
     r_a    = result["r"][idx]
 
-    # --- Estimated bearing ---
-    # r_dot = vdx * dx / r  →  dx_est = r_dot_est * r / vdx
-    # vdx = tx_vx - rx_vx.  Receiver knows rx_vx (GPS) but not tx_vx.
-    # We use the true vdx here so the bearing estimate is as good as possible
-    # given perfect self-knowledge.  In a real system this is the key unknown.
     t_pd, delta_f_pd = estimate_doppler_phase_diff(result["iq"], cfg.fs)
     r_dot_est_a = np.interp(t_anim, t_pd, -delta_f_pd * cfg.c / cfg.fc)
     vdx   = cfg.tx_vx - cfg.rx_vx
     dy    = cfg.tx_y - cfg.rx_y
-    # Avoid divide-by-zero for co-located (vdx≈0); fall back to rx_vx
     v_ref = vdx if abs(vdx) > 0.5 else cfg.rx_vx
-    dx_est      = r_dot_est_a * r_a / v_ref
-    los_est_a   = np.arctan2(dy, dx_est)
+    los_est_a = np.arctan2(dy, r_dot_est_a * r_a / v_ref)
 
-    # ---- Layout ----
+    trail = max(5, n_f // 15)
+
+    # ---- Build figure once; all artists are mutated in the loop -----------
     fig = plt.figure(figsize=(11, 5))
     fig.patch.set_facecolor('#1a1a2e')
     gs     = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1.6, 1])
@@ -402,25 +429,24 @@ def make_animation(result: dict, out_path: Path):
     ax2d.tick_params(colors='white'); ax2d.grid(True, alpha=0.25, color='#555')
     ax2d.set_title("Vehicle positions", color='white', fontsize=10)
 
-    ax_pol.set_theta_zero_location('E')
-    ax_pol.set_theta_direction(1)
+    ax_pol.set_theta_zero_location('E'); ax_pol.set_theta_direction(1)
     ax_pol.set_ylim(0, 1.3); ax_pol.set_yticks([])
     ax_pol.set_title("Tx bearing\n(from Rx, 0°=ahead)", color='white', fontsize=9, pad=12)
     for angle, lbl in [(0,'Ahead'),(np.pi/2,'Left'),(np.pi,'Behind'),(-np.pi/2,'Right')]:
         ax_pol.text(angle, 1.22, lbl, ha='center', va='center', color='#888', fontsize=7)
 
+    # Static traces
     ax2d.plot(result["tx_x"], result["tx_y"], color=C["tx"], alpha=0.15, lw=1)
     ax2d.plot(result["rx_x"], result["rx_y"], color=C["rx"], alpha=0.15, lw=1)
     ax2d.plot([], [], 'o', color=C["tx"], ms=7, label='Tx')
     ax2d.plot([], [], 'o', color=C["rx"], ms=7, label='Rx')
     ax2d.legend(fontsize=8, facecolor='#222', labelcolor='white', loc='lower right')
-
-    ax_pol.plot([], [], '-o', color=C["gt"], ms=5, label='True')
-    ax_pol.plot([], [], '-o', color=C["pd"], ms=5, label='Est.')
+    ax_pol.plot([], [], '-', color=C["gt"], lw=2, label='True')
+    ax_pol.plot([], [], '-', color=C["pd"], lw=2, label='Est.')
     ax_pol.legend(fontsize=7, facecolor='#222', labelcolor='white',
                   loc='upper left', bbox_to_anchor=(1.05, 1.12))
 
-    trail = max(5, n_f // 15)
+    # Mutable artists
     tx_trail, = ax2d.plot([], [], color=C["tx"], lw=1.5, alpha=0.5)
     rx_trail, = ax2d.plot([], [], color=C["rx"], lw=1.5, alpha=0.5)
     tx_dot,   = ax2d.plot([], [], 'o', color=C["tx"], ms=10, zorder=5)
@@ -428,53 +454,47 @@ def make_animation(result: dict, out_path: Path):
     los_line, = ax2d.plot([], [], '--', color='white', lw=0.8, alpha=0.5)
     time_txt  = ax2d.text(0.02, 0.95, '', transform=ax2d.transAxes,
                           color='white', fontsize=9, va='top')
+    pol_gt_ln,   = ax_pol.plot([], [], '-', color=C["gt"], lw=2.5)
+    pol_est_ln,  = ax_pol.plot([], [], '-', color=C["pd"], lw=2.5, alpha=0.9)
+    pol_gt_dot,  = ax_pol.plot([], [], 'o', color=C["gt"], ms=8)
+    pol_est_dot, = ax_pol.plot([], [], 'o', color=C["pd"], ms=8)
+    range_txt    = ax_pol.text(np.pi * 1.25, 1.5, '', color='white',
+                               fontsize=8, ha='center', va='center')
 
-    pol_gt_ln,  = ax_pol.plot([], [], '-', color=C["gt"], lw=2.5)
-    pol_est_ln, = ax_pol.plot([], [], '-', color=C["pd"], lw=2.5, alpha=0.9)
-    pol_gt_dot, = ax_pol.plot([], [], 'o', color=C["gt"], ms=8)
-    pol_est_dot,= ax_pol.plot([], [], 'o', color=C["pd"], ms=8)
-    range_txt   = ax_pol.text(np.pi * 1.25, 1.5, '', color='white',
-                              fontsize=8, ha='center', va='center')
+    plt.tight_layout()
 
-    all_artists = [tx_trail, rx_trail, tx_dot, rx_dot, los_line,
-                   pol_gt_ln, pol_est_ln, pol_gt_dot, pol_est_dot,
-                   time_txt, range_txt]
+    # ---- Direct writer loop — no FuncAnimation overhead ------------------
+    def _render(writer, file_path, dpi):
+        with writer.saving(fig, str(file_path), dpi=dpi):
+            for i in range(n_f):
+                sl = slice(max(0, i - trail), i + 1)
+                tx_trail.set_data(tx_x_a[sl], tx_y_a[sl])
+                rx_trail.set_data(rx_x_a[sl], rx_y_a[sl])
+                tx_dot.set_data([tx_x_a[i]], [tx_y_a[i]])
+                rx_dot.set_data([rx_x_a[i]], [rx_y_a[i]])
+                los_line.set_data([rx_x_a[i], tx_x_a[i]], [rx_y_a[i], tx_y_a[i]])
+                time_txt.set_text(f"t = {t_anim[i]:.2f} s")
+                pol_gt_ln.set_data( [los_a[i],     los_a[i]],     [0, 1.0])
+                pol_est_ln.set_data([los_est_a[i], los_est_a[i]], [0, 1.0])
+                pol_gt_dot.set_data( [los_a[i]],     [1.0])
+                pol_est_dot.set_data([los_est_a[i]], [1.0])
+                range_txt.set_text(f"r = {r_a[i]:.0f} m")
+                writer.grab_frame()
 
-    def init():
-        for a in all_artists:
-            (a.set_text('') if hasattr(a, 'set_text') else a.set_data([], []))
-        return all_artists
-
-    def update(i):
-        sl = slice(max(0, i - trail), i + 1)
-        tx_trail.set_data(tx_x_a[sl], tx_y_a[sl])
-        rx_trail.set_data(rx_x_a[sl], rx_y_a[sl])
-        tx_dot.set_data([tx_x_a[i]], [tx_y_a[i]])
-        rx_dot.set_data([rx_x_a[i]], [rx_y_a[i]])
-        los_line.set_data([rx_x_a[i], tx_x_a[i]], [rx_y_a[i], tx_y_a[i]])
-        time_txt.set_text(f"t = {t_anim[i]:.2f} s")
-        pol_gt_ln.set_data( [los_a[i],     los_a[i]],     [0, 1.0])
-        pol_est_ln.set_data([los_est_a[i], los_est_a[i]], [0, 1.0])
-        pol_gt_dot.set_data( [los_a[i]],      [1.0])
-        pol_est_dot.set_data([los_est_a[i]],  [1.0])
-        range_txt.set_text(f"r = {r_a[i]:.0f} m")
-        return all_artists
-
-    anim = FuncAnimation(fig, update, frames=n_f, init_func=init,
-                         blit=True, interval=1000 / fps)
     try:
-        w = FFMpegWriter(fps=fps, metadata=dict(title=result["scenario_name"]))
-        anim.save(str(out_path.with_suffix(".mp4")), writer=w,
-                  dpi=SimConfig.ANIMATION_DPI_MP4,
-                  savefig_kwargs=dict(facecolor=fig.get_facecolor()))
-        print(f"    Animation → {out_path.with_suffix('.mp4')}")
+        mp4_path = out_path.with_suffix(".mp4")
+        w = FFMpegWriter(fps=fps, metadata=dict(title=result["scenario_name"]),
+                         extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv420p',
+                                     '-preset', 'fast', '-crf', '23'])
+        _render(w, mp4_path, SimConfig.ANIMATION_DPI_MP4)
+        print(f"    Animation → {mp4_path}")
     except Exception as e:
         print(f"    ffmpeg unavailable ({e}), falling back to GIF...")
+        gif_path = out_path.with_suffix(".gif")
         w = PillowWriter(fps=fps)
-        anim.save(str(out_path.with_suffix(".gif")), writer=w,
-                  dpi=SimConfig.ANIMATION_DPI_GIF,
-                  savefig_kwargs=dict(facecolor=fig.get_facecolor()))
-        print(f"    Animation → {out_path.with_suffix('.gif')}")
+        _render(w, gif_path, SimConfig.ANIMATION_DPI_GIF)
+        print(f"    Animation → {gif_path}")
+
     plt.close(fig)
 
 
@@ -509,8 +529,8 @@ def save_all(result: dict, out_root: str = "plots"):
 if __name__ == "__main__":
     np.random.seed(42)
     scenarios = [
-        # ("Co-located",     scenario_colocated()),
-        # ("Same-direction", scenario_same_direction()),
+        ("Co-located",     scenario_colocated()),
+        ("Same-direction", scenario_same_direction()),
         ("Oncoming",       scenario_oncoming()),
     ]
     for name, cfg in scenarios:
