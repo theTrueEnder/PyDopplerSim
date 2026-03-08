@@ -1,5 +1,5 @@
 # PyDopplerSim
-A basband signal (RF) simulator that models Doppler behavior of a concurrently mobile RX (receiver) and TX (transmitter).
+A Python-based baseband signal (RF) simulator that models Doppler behavior of a concurrently mobile RX (receiver) and TX (transmitter).
 
 ![animation.gif](https://github.com/theTrueEnder/PyDopplerSim/blob/main/animation.gif)
 
