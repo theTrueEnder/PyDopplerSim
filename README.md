@@ -6,3 +6,6 @@ Why is PyDopplerSim unique? It combines...
 - True physical layer baseband signal processing through IQ values
 - AWGN modelling
 - Python framework for easy porting to GNU Radio blocks
+
+
+!(animation.gif)[Example Scenario Visualization]
