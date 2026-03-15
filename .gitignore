@@ -1,1 +1,4 @@
 *.png
+/__pycache__
+/dsp/__pycache__
+/plotting/__pycache__

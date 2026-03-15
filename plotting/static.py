@@ -162,6 +162,55 @@ def plot_rdot_rddot(result: dict, out_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Figure 2b: r_dot and r_ddot - smoothed + ground truth only
+# ---------------------------------------------------------------------------
+
+def plot_rdot_rddot_smooth_gt(result: dict, out_path: Path) -> None:
+    """
+    Top   : Radial velocity r_dot(t), ground truth and smoothed estimate.
+    Bottom: Radial acceleration r_ddot(t), ground truth and smoothed estimate.
+    """
+    cfg      = result["cfg"]
+    t        = result["t"]
+    _, kin   = _run_estimators(result)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=False)
+    fig.suptitle(f"{result['scenario_name']} - Radial kinematics (smoothed + GT)",
+                 fontweight='bold')
+
+    import matplotlib.lines as mlines
+    legend_handles = [
+        mlines.Line2D([], [], label='Ground truth', **LS["gt"]),
+        mlines.Line2D([], [], label='Smoothed estimate', **LS["smoothed"]),
+    ]
+
+    # r_dot subplot
+    ax = axes[0]
+    ax.plot(t,            result["r_dot"],         **LS["gt"])
+    ax.plot(kin["t_dot"], kin["r_dot_smoothed"],  **LS["smoothed"])
+    ax.axhline(0, color='gray', lw=0.8, ls=':')
+    ax.set_xlabel("Time [s]"); ax.set_ylabel("r_dot [m/s]")
+    ax.set_title("Radial velocity r_dot(t)  [zero-crossing = CPA]")
+    ax.legend(handles=legend_handles, fontsize=8, loc='upper right')
+    ax.grid(True, alpha=0.4)
+
+    # r_ddot subplot
+    ax = axes[1]
+    ax.plot(t,                    result["r_ddot"],         **LS["gt"])
+    ax.plot(kin["t_ddot_smooth"], kin["r_ddot_smoothed"],   **LS["smoothed"])
+    ax.axhline(0, color='gray', lw=0.8, ls=':')
+    ax.set_xlabel("Time [s]"); ax.set_ylabel("r_ddot [m/s^2]")
+    ax.set_title(f"Radial acceleration r_ddot(t)  [r_ddot_CPA ~= vrel^2 / r_min = "
+                 f"{(cfg.tx_vx - cfg.rx_vx)**2 / max(cfg.tx_y - cfg.rx_y, 0.01):.0f} m/s^2]")
+    ax.legend(handles=legend_handles, fontsize=8, loc='upper right')
+    ax.grid(True, alpha=0.4)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Figure 3: Doppler estimation — phase-diff + STFT
 # ---------------------------------------------------------------------------
 
@@ -223,4 +272,5 @@ def plot_doppler(result: dict, out_path: Path) -> None:
 def save_static_plots(result: dict, out_dir: Path) -> None:
     plot_trajectory(result,  out_dir / "trajectory.png")
     plot_rdot_rddot(result,  out_dir / "rdot_rddot.png")
+    plot_rdot_rddot_smooth_gt(result, out_dir / "rdot_rddot_smooth_gt.png")
     plot_doppler(result,     out_dir / "doppler.png")
