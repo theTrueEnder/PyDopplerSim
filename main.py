@@ -141,11 +141,7 @@ def main():
 
     # Override render formats if specified
     if args.render_formats:
-        original_format = SimConfig.RENDER_FORMATS
         SimConfig.RENDER_FORMATS = args.render_formats.upper()
-        # Need to re-parse
-        global RENDER_MP4, RENDER_GIF
-        from config import RENDER_MP4, RENDER_GIF
 
     # Load IQ if requested
     iq_data = None

@@ -29,7 +29,7 @@ from matplotlib.animation import FFMpegWriter, PillowWriter
 import numpy as np
 
 # Import our modules
-from config import SimConfig, RENDER_MP4, RENDER_GIF
+from config import SimConfig
 from estimation import estimate_doppler_phase_diff, estimate_doppler_stft
 from kinematics import recover_kinematics
 
@@ -52,6 +52,44 @@ def timed(label: str):
     finally:
         dt = time.perf_counter() - t0
         log.info(f"DONE   {label}  ({dt:.2f}s)")
+
+
+def _estimate_tx_positions(result: dict, t_est: np.ndarray, delta_f_est: np.ndarray) -> dict:
+    """
+    Estimate TX position from Doppler using the stated T11 inversion.
+
+    This estimate is only observable when the relative longitudinal velocity
+    is large enough to recover dx from r_dot.
+    """
+    cfg = result["cfg"]
+    t = result["t"]
+    trim = SimConfig.PD_SMOOTH_WINDOW // 2
+
+    r_dot_est = -delta_f_est * cfg.c / cfg.fc
+    r_dot_est_interp = np.interp(t, t_est, r_dot_est)
+
+    vdx = cfg.tx_vx - cfg.rx_vx
+    observable = abs(vdx) > 0.5
+
+    tx_x_est = np.full_like(t, np.nan, dtype=float)
+    tx_y_est = np.full_like(t, np.nan, dtype=float)
+    los_est = np.full_like(t, np.nan, dtype=float)
+    valid_mask = np.zeros_like(t, dtype=bool)
+
+    if observable:
+        dx_est = r_dot_est_interp * result["r"] / vdx
+        tx_x_est = result["rx_x"] + dx_est
+        tx_y_est = result["rx_y"] + (cfg.tx_y - cfg.rx_y)
+        los_est = np.arctan2(tx_y_est - result["rx_y"], dx_est)
+        valid_mask[trim:-trim] = True
+
+    return dict(
+        tx_x_est=tx_x_est,
+        tx_y_est=tx_y_est,
+        los_est=los_est,
+        valid_mask=valid_mask,
+        observable=observable,
+    )
 
 
 # =============================================================================
@@ -293,28 +331,9 @@ def plot_tx_derivation_fig(result: dict, est_pd: dict, out_path: Path) -> None:
     """
     C = C_STATIC
     cfg = result["cfg"]
-    t = result["t"]
+    est_tx = _estimate_tx_positions(result, est_pd["t"], est_pd["delta_f"])
 
-    # Compute estimated TX trajectory
-    # From Doppler: ṙ_est = -Δf * c / fc
-    r_dot_est = -est_pd["delta_f"] * cfg.c / cfg.fc
-
-    # Interpolate to match result length (phase-diff produces N-1 samples)
-    t_pd = est_pd["t"]
-    r_dot_est_interp = np.interp(t, t_pd, r_dot_est)
-
-    # Get reference velocity (use true vdx for now)
-    vdx = cfg.tx_vx - cfg.rx_vx
-    v_ref = vdx if abs(vdx) > 0.5 else cfg.rx_vx
-
-    # Compute bearing angle
-    dy = cfg.tx_y - cfg.rx_y
-    dx_est = r_dot_est_interp * result["r"] / v_ref
-    los_est = np.arctan2(dy, dx_est)
-
-    # Estimate TX position: tx = rx + r * direction
-    tx_x_est = result["rx_x"] + result["r"] * np.cos(los_est)
-    tx_y_est = result["rx_y"] + result["r"] * np.sin(los_est)
+    # The estimate is only drawn when the Doppler inversion is observable.
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     fig.suptitle(f"{result['scenario_name']} — TX Path Derivation", fontweight="bold")
@@ -323,18 +342,33 @@ def plot_tx_derivation_fig(result: dict, est_pd: dict, out_path: Path) -> None:
     ax.plot(result["tx_x"], result["tx_y"], color=C["tx"], lw=2, label="True TX")
     ax.plot(result["rx_x"], result["rx_y"], color=C["rx"], lw=2, label="RX")
 
-    # Plot estimated TX trajectory (only where valid, i.e., middle portion)
-    trim = SimConfig.PD_SMOOTH_WINDOW // 2
-    valid_slice = slice(trim, -trim)
-    ax.plot(
-        tx_x_est[valid_slice],
-        tx_y_est[valid_slice],
-        color=C["tx_est"],
-        lw=1.5,
-        alpha=0.8,
-        linestyle="--",
-        label="Estimated TX",
-    )
+    if est_tx["observable"] and np.any(est_tx["valid_mask"]):
+        ax.plot(
+            est_tx["tx_x_est"][est_tx["valid_mask"]],
+            est_tx["tx_y_est"][est_tx["valid_mask"]],
+            color=C["tx_est"],
+            lw=1.5,
+            alpha=0.8,
+            linestyle="--",
+            label="Estimated TX",
+        )
+    else:
+        ax.text(
+            0.02,
+            0.95,
+            "TX x-position is unobservable here because |tx_vx - rx_vx| is too small.",
+            transform=ax.transAxes,
+            fontsize=9,
+            color=C["tx_est"],
+            va="top",
+            ha="left",
+            bbox=dict(
+                boxstyle="round,pad=0.3",
+                facecolor="white",
+                alpha=0.8,
+                edgecolor="none",
+            ),
+        )
 
     # Mark start positions
     ax.scatter(
@@ -393,18 +427,8 @@ def _build_animation_frame_data(result: dict) -> dict:
 
     # Phase-diff Doppler estimate → ṙ_est → bearing estimate
     t_pd, delta_f_pd = estimate_doppler_phase_diff(result["iq"], cfg.fs)
-    r_dot_est_a = np.interp(t_anim, t_pd, -delta_f_pd * cfg.c / cfg.fc)
-
-    vdx = cfg.tx_vx - cfg.rx_vx
-    dy = cfg.tx_y - cfg.rx_y
-    v_ref = vdx if abs(vdx) > 0.5 else cfg.rx_vx  # fallback for co-located (vdx ≈ 0)
+    est_tx = _estimate_tx_positions(result, t_pd, delta_f_pd)
     r_a = result["r"][idx]
-    dx_est = r_dot_est_a * r_a / v_ref
-    los_est_a = np.arctan2(dy, dx_est)  # arctan2 handles all four quadrants
-
-    # Compute estimated TX position (T12)
-    tx_x_est_a = result["rx_x"][idx] + r_a * np.cos(los_est_a)
-    tx_y_est_a = result["rx_y"][idx] + r_a * np.sin(los_est_a)
 
     return dict(
         t_anim=t_anim,
@@ -413,10 +437,11 @@ def _build_animation_frame_data(result: dict) -> dict:
         rx_x_a=result["rx_x"][idx],
         rx_y_a=result["rx_y"][idx],
         los_a=result["los_angle"][idx],
-        los_est_a=los_est_a,
+        los_est_a=est_tx["los_est"][idx],
         r_a=r_a,
-        tx_x_est_a=tx_x_est_a,
-        tx_y_est_a=tx_y_est_a,
+        tx_x_est_a=est_tx["tx_x_est"][idx],
+        tx_y_est_a=est_tx["tx_y_est"][idx],
+        tx_est_observable=est_tx["observable"],
     )
 
 
@@ -601,7 +626,11 @@ def make_animation(result: dict, out_path: Path) -> None:
     Render animation to MP4 and/or GIF depending on SimConfig.RENDER_FORMATS.
     The figure and frame data are built once and reused across both formats.
     """
-    if not (RENDER_MP4 or RENDER_GIF):
+    fmt = SimConfig.RENDER_FORMATS.lower().strip()
+    render_mp4 = fmt in ("mp4", "both")
+    render_gif = fmt in ("gif", "both")
+
+    if not (render_mp4 or render_gif):
         log.info("  Animation skipped (RENDER_FORMATS='none')")
         return
 
@@ -613,7 +642,7 @@ def make_animation(result: dict, out_path: Path) -> None:
     with timed("  build figure"):
         fig, artists = _build_animation_figure(result)
 
-    if RENDER_MP4:
+    if render_mp4:
         mp4_path = out_path.with_suffix(".mp4")
         with timed(
             f"  render MP4  ({SimConfig.ANIMATION_N_FRAMES} frames, "
@@ -641,7 +670,7 @@ def make_animation(result: dict, out_path: Path) -> None:
             except Exception as e:
                 log.warning(f"  MP4 render failed: {e}")
 
-    if RENDER_GIF:
+    if render_gif:
         gif_path = out_path.with_suffix(".gif")
         with timed(
             f"  render GIF  ({SimConfig.ANIMATION_N_FRAMES} frames, "

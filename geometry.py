@@ -4,7 +4,7 @@ Geometry module for PyDopplerSim.
 Computes r(t), ṙ(t), r̈(t), delta_f, and bearing from positions.
 """
 
-__all__ = ["compute_geometry"]
+__all__ = ["compute_geometry", "compute_geometry_from_samples"]
 
 import numpy as np
 
@@ -67,5 +67,43 @@ def compute_geometry(cfg, t: np.ndarray) -> dict:
         rx_x=rx_x,
         tx_y=np.full_like(t, cfg.tx_y),
         rx_y=np.full_like(t, cfg.rx_y),
+        los_angle=np.arctan2(dy, dx),
+    )
+
+
+def compute_geometry_from_samples(
+    tx_x: np.ndarray,
+    tx_y: np.ndarray,
+    rx_x: np.ndarray,
+    rx_y: np.ndarray,
+    t: np.ndarray,
+    fc: float,
+    c: float,
+) -> dict:
+    """
+    Compute geometry from sampled world-frame trajectories.
+
+    This supports custom waypoint paths where the TX no longer follows the
+    closed-form constant-velocity model used by compute_geometry().
+    """
+    dx = tx_x - rx_x
+    dy = tx_y - rx_y
+    r = np.sqrt(dx**2 + dy**2)
+    safe_r = np.where(r < 1e-6, 1e-6, r)
+
+    vdx = np.gradient(dx, t, edge_order=2)
+    vdy = np.gradient(dy, t, edge_order=2)
+    r_dot = (dx * vdx + dy * vdy) / safe_r
+    r_ddot = np.gradient(r_dot, t, edge_order=2)
+
+    return dict(
+        r=r,
+        r_dot=r_dot,
+        r_ddot=r_ddot,
+        delta_f=-r_dot * fc / c,
+        tx_x=tx_x,
+        rx_x=rx_x,
+        tx_y=tx_y,
+        rx_y=rx_y,
         los_angle=np.arctan2(dy, dx),
     )

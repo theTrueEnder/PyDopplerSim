@@ -17,9 +17,10 @@ from typing import Optional
 
 # Import geometry - will be available after T2
 try:
-    from geometry import compute_geometry
+    from geometry import compute_geometry, compute_geometry_from_samples
 except ImportError:
     compute_geometry = None
+    compute_geometry_from_samples = None
 
 
 def generate_iq(cfg, path_provider: Optional[object] = None):
@@ -67,22 +68,11 @@ def generate_iq(cfg, path_provider: Optional[object] = None):
     if path_provider is not None:
         # Use custom path for TX
         tx_x_fine, tx_y_fine = path_provider.interpolate(t_fine)
-
-        # Build a temporary config-like object for compute_geometry
-        class PathGeometry:
-            pass
-
-        geo_cfg = PathGeometry()
-        geo_cfg.tx_x0 = tx_x_fine[0]
-        geo_cfg.tx_y = tx_y_fine[0]
-        geo_cfg.tx_vx = (tx_x_fine[-1] - tx_x_fine[0]) / cfg.duration
-        geo_cfg.rx_x0 = cfg.rx_x0
-        geo_cfg.rx_y = cfg.rx_y
-        geo_cfg.rx_vx = cfg.rx_vx
-        geo_cfg.fc = cfg.fc
-        geo_cfg.c = cfg.c
-
-        geo_f = compute_geometry(geo_cfg, t_fine)
+        rx_x_fine = cfg.rx_x0 + cfg.rx_vx * t_fine
+        rx_y_fine = np.full_like(t_fine, cfg.rx_y)
+        geo_f = compute_geometry_from_samples(
+            tx_x_fine, tx_y_fine, rx_x_fine, rx_y_fine, t_fine, cfg.fc, cfg.c
+        )
     else:
         geo_f = compute_geometry(cfg, t_fine)
 
@@ -104,7 +94,10 @@ def generate_iq(cfg, path_provider: Optional[object] = None):
 
     # Ground-truth geometry at output sample rate
     if path_provider is not None:
-        geo = compute_geometry(geo_cfg, t)
+        tx_x, tx_y = path_provider.interpolate(t)
+        rx_x = cfg.rx_x0 + cfg.rx_vx * t
+        rx_y = np.full_like(t, cfg.rx_y)
+        geo = compute_geometry_from_samples(tx_x, tx_y, rx_x, rx_y, t, cfg.fc, cfg.c)
     else:
         geo = compute_geometry(cfg, t)
 
