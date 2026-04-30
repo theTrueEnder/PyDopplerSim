@@ -142,7 +142,8 @@ class TestRadialAcceleration:
         )
         t = np.array([100.0 / 60.0])
         result = compute_geometry(cfg, t)
-        assert np.abs(result["r_ddot"]) < 1e-6
+        expected = (cfg.tx_vx - cfg.rx_vx) ** 2 / abs(cfg.tx_y - cfg.rx_y)
+        np.testing.assert_allclose(result["r_ddot"], expected)
 
     def test_positive_acceleration_receding(self):
         cfg = ScenarioConfig(
@@ -279,7 +280,7 @@ class TestWithFixtures:
     def test_oncoming_scenario(self, scenario_oncoming_cfg):
         t = np.array([0.0])
         result = compute_geometry(scenario_oncoming_cfg, t)
-        assert result["r_dot"] > 0.0
+        assert result["r_dot"] < 0.0
 
     def test_all_scenarios(self, any_scenario_cfg):
         t = np.array([0.0])

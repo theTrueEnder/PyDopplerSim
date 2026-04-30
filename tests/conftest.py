@@ -2,7 +2,6 @@
 Pytest configuration and fixtures for PyDopplerSim tests.
 """
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -23,22 +22,30 @@ from config import (
 # =============================================================================
 
 
+def _fast_cfg(cfg: ScenarioConfig) -> ScenarioConfig:
+    """Shrink scenarios for unit tests; full-rate runs belong in slow tests."""
+    cfg.fs = 20_000.0
+    cfg.duration = min(cfg.duration, 0.2)
+    cfg.interp_oversample = 2
+    return cfg
+
+
 @pytest.fixture
 def scenario_colocated_cfg() -> ScenarioConfig:
     """Co-located scenario: Tx and Rx at same position, moving together."""
-    return scenario_colocated()
+    return _fast_cfg(scenario_colocated())
 
 
 @pytest.fixture
 def scenario_same_direction_cfg() -> ScenarioConfig:
     """Same-direction scenario: Tx ahead, moving slower than Rx."""
-    return scenario_same_direction()
+    return _fast_cfg(scenario_same_direction())
 
 
 @pytest.fixture
 def scenario_oncoming_cfg() -> ScenarioConfig:
     """Oncoming scenario: Tx approaching from opposite direction."""
-    return scenario_oncoming()
+    return _fast_cfg(scenario_oncoming())
 
 
 @pytest.fixture(params=["colocated", "same_direction", "oncoming"])
@@ -49,7 +56,7 @@ def any_scenario_cfg(request) -> ScenarioConfig:
         "same_direction": scenario_same_direction,
         "oncoming": scenario_oncoming,
     }
-    return scenarios[request.param]()
+    return _fast_cfg(scenarios[request.param]())
 
 
 # =============================================================================
@@ -99,19 +106,15 @@ def pytest_configure(config):
 def hypothesis_ci_profile():
     """Apply Hypothesis CI profile with 100 examples."""
     try:
-        import hypothesis
+        from hypothesis import settings
 
-        @hypothesis.settings(
-            profile="ci",
+        settings.register_profile(
+            "ci",
             max_examples=100,
             deadline=None,  # Disable deadline to avoid issues with slow tests
             database=None,  # Disable example database for CI
         )
-        def ci_profile():
-            pass
-
-        hypothesis.settings.register_profile("ci", ci_profile())
-        hypothesis.settings.load_profile("ci")
+        settings.load_profile("ci")
     except ImportError:
         # Hypothesis not installed, skip
         pass

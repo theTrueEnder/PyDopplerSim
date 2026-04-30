@@ -198,7 +198,7 @@ class TestAngledPath:
         t_query = np.array([0.0, 1.0])
         x, y = path.interpolate(t_query)
 
-        np.testing.assert_allclose(x, [0.0, 0.0])
+        np.testing.assert_allclose(x, [0.0, 0.0], atol=1e-12)
         np.testing.assert_allclose(y, [0.0, 10.0])
 
     def test_angled_path_45_degrees(self):

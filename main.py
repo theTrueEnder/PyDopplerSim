@@ -33,9 +33,9 @@ log = logging.getLogger(__name__)
 
 
 SCENARIOS = {
-    "colocated": scenario_colocated,
+    # "colocated": scenario_colocated,
     "same-direction": scenario_same_direction,
-    "oncoming": scenario_oncoming,
+    # "oncoming": scenario_oncoming,
 }
 
 

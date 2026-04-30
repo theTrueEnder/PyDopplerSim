@@ -163,6 +163,55 @@ class TestRecoverKinematics:
         if len(valid_rddot) > 0:
             np.testing.assert_allclose(valid_rddot, 0.0, atol=0.5)
 
+    def test_rx_velocity_disabled_returns_core_outputs_only(self, simple_doppler_signal):
+        """Doppler-only recovery should not include velocity-aware metadata."""
+        t, delta_f, fc, c, _ = simple_doppler_signal
+
+        result = recover_kinematics(t, delta_f, fc, c)
+
+        assert set(result) == {"t_dot", "r_dot", "t_ddot", "r_ddot"}
+
+    def test_rx_velocity_enabled_marks_unobservable_quantities(
+        self, simple_doppler_signal
+    ):
+        """RX velocity does not make range, bearing, or TX position observable."""
+        t, delta_f, fc, c, _ = simple_doppler_signal
+
+        result = recover_kinematics(
+            t,
+            delta_f,
+            fc,
+            c,
+            rx_knows_velocity=True,
+            rx_vx=30.0,
+        )
+
+        assert result["rx_velocity_known"] is True
+        assert result["rx_vx"] == 30.0
+        assert result["observability"]["range"] is False
+        assert result["observability"]["bearing"] is False
+        assert result["observability"]["tx_position"] is False
+
+    def test_rx_velocity_bearing_grid_constraint(self, simple_doppler_signal):
+        """Candidate TX line-of-sight velocity constraints use RX velocity only."""
+        t, delta_f, fc, c, _ = simple_doppler_signal
+        bearing_grid = np.array([0.0, np.pi / 2, np.pi])
+
+        result = recover_kinematics(
+            t,
+            delta_f,
+            fc,
+            c,
+            rx_knows_velocity=True,
+            rx_vx=30.0,
+            bearing_grid_rad=bearing_grid,
+        )
+
+        expected = result["r_dot"][:, np.newaxis] + 30.0 * np.cos(bearing_grid)
+        np.testing.assert_allclose(
+            result["tx_los_velocity_grid"], expected, equal_nan=True
+        )
+
     @pytest.mark.parametrize("duration", [0.1, 0.5, 1.0])
     @pytest.mark.slow
     def test_various_durations(self, duration):

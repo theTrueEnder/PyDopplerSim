@@ -6,7 +6,7 @@ that regular unit tests might miss.
 """
 
 import numpy as np
-from hypothesis import given, settings, assume, verbosity
+from hypothesis import Verbosity, given, settings, assume
 import hypothesis.strategies as st
 
 from config import ScenarioConfig, scenario_oncoming
@@ -40,6 +40,14 @@ def speed_of_light_strategy():
     return st.floats(min_value=2.9e8, max_value=3.0e8, allow_nan=False, allow_infinity=False)
 
 
+def fast_cfg(cfg):
+    """Keep property tests fast; full-rate simulations are integration tests."""
+    cfg.fs = 20_000.0
+    cfg.duration = min(cfg.duration, 0.2)
+    cfg.interp_oversample = 2
+    return cfg
+
+
 # =============================================================================
 # Property: output has correct keys
 # =============================================================================
@@ -48,7 +56,7 @@ def speed_of_light_strategy():
     snr_db=st.sampled_from([20.0, 30.0]),
     fc=carrier_freq_strategy(),
 )
-@settings(deadline=None, max_examples=30, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
 def test_output_has_correct_keys(snr_db, fc):
     """
     Property: recover_kinematics returns dict with all expected keys.
@@ -56,7 +64,7 @@ def test_output_has_correct_keys(snr_db, fc):
     The function should always return a dictionary with the four required keys:
     t_dot, r_dot, t_ddot, r_ddot.
     """
-    cfg = scenario_oncoming()
+    cfg = fast_cfg(scenario_oncoming())
     cfg.snr_db = snr_db
     cfg.fc = fc
     
@@ -84,7 +92,7 @@ def test_output_has_correct_keys(snr_db, fc):
     fc=carrier_freq_strategy(),
     c=speed_of_light_strategy(),
 )
-@settings(deadline=None, max_examples=30, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
 def test_no_division_by_zero(snr_db, fc, c):
     """
     Property: Function handles inputs without division by zero errors.
@@ -92,7 +100,7 @@ def test_no_division_by_zero(snr_db, fc, c):
     The function should gracefully handle all valid inputs without
     raising ZeroDivisionError.
     """
-    cfg = scenario_oncoming()
+    cfg = fast_cfg(scenario_oncoming())
     cfg.snr_db = snr_db
     cfg.fc = fc
     
@@ -121,14 +129,14 @@ def test_no_division_by_zero(snr_db, fc, c):
     fc=carrier_freq_strategy(),
     c=speed_of_light_strategy(),
 )
-@settings(deadline=None, max_examples=30, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
 def test_radial_velocity_formula(snr_db, fc, c):
     """
     Property: r_dot = -delta_f * c / fc should hold exactly.
     
     This is the direct inversion of the Doppler equation.
     """
-    cfg = scenario_oncoming()
+    cfg = fast_cfg(scenario_oncoming())
     cfg.snr_db = snr_db
     cfg.fc = fc
     
@@ -159,7 +167,7 @@ def test_radial_velocity_formula(snr_db, fc, c):
 @given(
     snr_db=st.sampled_from([20.0]),
 )
-@settings(deadline=None, max_examples=20, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=20, verbosity=Verbosity.normal)
 def test_output_array_lengths(snr_db):
     """
     Property: Output arrays have expected lengths.
@@ -167,7 +175,7 @@ def test_output_array_lengths(snr_db):
     t_dot and r_dot should have same length as input (full rate).
     t_ddot and r_ddot should have decimated length.
     """
-    cfg = scenario_oncoming()
+    cfg = fast_cfg(scenario_oncoming())
     cfg.snr_db = snr_db
     
     data = generate_iq(cfg)
@@ -196,14 +204,14 @@ def test_output_array_lengths(snr_db):
     snr_db=st.sampled_from([20.0, 40.0]),
     smooth_window=st.integers(min_value=101, max_value=501),
 )
-@settings(deadline=None, max_examples=20, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=20, verbosity=Verbosity.normal)
 def test_no_nan_except_at_edges(snr_db, smooth_window):
     """
     Property: NaN values only appear at edges (due to smoother window).
     
     The function marks edge transients as NaN, but the middle should be valid.
     """
-    cfg = scenario_oncoming()
+    cfg = fast_cfg(scenario_oncoming())
     cfg.snr_db = snr_db
     
     data = generate_iq(cfg)
@@ -231,7 +239,7 @@ def test_no_nan_except_at_edges(snr_db, smooth_window):
     c=speed_of_light_strategy(),
     n_samples=st.integers(min_value=100, max_value=500),
 )
-@settings(deadline=None, max_examples=30, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
 def test_handles_extreme_doppler_values(fc, c, n_samples):
     """
     Property: Function handles extreme (large magnitude) delta_f values.
@@ -262,7 +270,7 @@ def test_handles_extreme_doppler_values(fc, c, n_samples):
     c=speed_of_light_strategy(),
     n_samples=st.integers(min_value=100, max_value=500),
 )
-@settings(deadline=None, max_examples=30, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
 def test_handles_zero_doppler(fc, c, n_samples):
     """
     Property: Function handles zero Doppler shift (stationary scenario).
@@ -293,7 +301,7 @@ def test_handles_zero_doppler(fc, c, n_samples):
     n_samples=st.integers(min_value=200, max_value=500),
     doppler_rate=st.floats(min_value=-1000.0, max_value=1000.0),
 )
-@settings(deadline=None, max_examples=30, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
 def test_handles_linear_doppler(fc, c, n_samples, doppler_rate):
     """
     Property: Function handles linearly changing Doppler (constant acceleration).
@@ -327,7 +335,7 @@ def test_handles_linear_doppler(fc, c, n_samples, doppler_rate):
     snr_db=st.sampled_from([30.0]),
     fc=carrier_freq_strategy(),
 )
-@settings(deadline=None, max_examples=20, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=20, verbosity=Verbosity.normal)
 def test_handles_various_carrier_frequencies(snr_db, fc):
     """
     Property: Function works correctly with various carrier frequencies.
@@ -335,7 +343,7 @@ def test_handles_various_carrier_frequencies(snr_db, fc):
     Different carrier frequencies should produce proportionally different
     r_dot estimates for the same delta_f.
     """
-    cfg = scenario_oncoming()
+    cfg = fast_cfg(scenario_oncoming())
     cfg.snr_db = snr_db
     cfg.fc = fc
     
@@ -358,18 +366,84 @@ def test_handles_various_carrier_frequencies(snr_db, fc):
 
 
 # =============================================================================
+# Property: RX velocity mode does not alter radial kinematics
+# =============================================================================
+
+@given(
+    fc=carrier_freq_strategy(),
+    c=speed_of_light_strategy(),
+    rx_vx=st.floats(min_value=-50.0, max_value=50.0, allow_nan=False, allow_infinity=False),
+    n_samples=st.integers(min_value=200, max_value=500),
+)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
+def test_rx_velocity_mode_preserves_radial_kinematics(fc, c, rx_vx, n_samples):
+    """RX velocity metadata must not change Doppler-derived r_dot or r_ddot."""
+    t_est = np.linspace(0, 0.1, n_samples)
+    delta_f_est = np.linspace(-100.0, 100.0, n_samples)
+
+    base = recover_kinematics(t_est, delta_f_est, fc, c)
+    with_rx = recover_kinematics(
+        t_est,
+        delta_f_est,
+        fc,
+        c,
+        rx_knows_velocity=True,
+        rx_vx=rx_vx,
+    )
+
+    np.testing.assert_allclose(with_rx["r_dot"], base["r_dot"], equal_nan=True)
+    np.testing.assert_allclose(with_rx["r_ddot"], base["r_ddot"], equal_nan=True)
+    assert with_rx["observability"]["range"] is False
+    assert with_rx["observability"]["bearing"] is False
+    assert with_rx["observability"]["tx_position"] is False
+
+
+# =============================================================================
+# Property: bearing grid returns velocity constraints only
+# =============================================================================
+
+@given(
+    fc=carrier_freq_strategy(),
+    c=speed_of_light_strategy(),
+    rx_vx=st.floats(min_value=-50.0, max_value=50.0, allow_nan=False, allow_infinity=False),
+)
+@settings(deadline=None, max_examples=30, verbosity=Verbosity.normal)
+def test_bearing_grid_constraint_formula(fc, c, rx_vx):
+    """Candidate TX line-of-sight velocity grid follows r_dot + rx_vx*cos(theta)."""
+    t_est = np.linspace(0, 0.1, 300)
+    delta_f_est = np.linspace(-200.0, 50.0, 300)
+    bearing_grid = np.linspace(-np.pi, np.pi, 9)
+
+    result = recover_kinematics(
+        t_est,
+        delta_f_est,
+        fc,
+        c,
+        rx_knows_velocity=True,
+        rx_vx=rx_vx,
+        bearing_grid_rad=bearing_grid,
+    )
+
+    expected = result["r_dot"][:, np.newaxis] + rx_vx * np.cos(bearing_grid)
+    assert result["tx_los_velocity_grid"].shape == expected.shape
+    np.testing.assert_allclose(
+        result["tx_los_velocity_grid"], expected, equal_nan=True
+    )
+
+
+# =============================================================================
 # Property: time arrays are properly ordered
 # =============================================================================
 
 @given(
     snr_db=st.sampled_from([30.0]),
 )
-@settings(deadline=None, max_examples=20, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=20, verbosity=Verbosity.normal)
 def test_time_arrays_are_ordered(snr_db):
     """
     Property: Output time arrays should be monotonically increasing.
     """
-    cfg = scenario_oncoming()
+    cfg = fast_cfg(scenario_oncoming())
     cfg.snr_db = snr_db
     
     data = generate_iq(cfg)

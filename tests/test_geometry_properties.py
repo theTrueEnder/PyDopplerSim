@@ -6,7 +6,7 @@ that regular unit tests might miss.
 """
 
 import numpy as np
-from hypothesis import given, settings, assume, verbosity
+from hypothesis import Verbosity, given, settings, assume
 import hypothesis.strategies as st
 
 from config import ScenarioConfig
@@ -51,7 +51,7 @@ def carrier_freq_strategy():
     fc=carrier_freq_strategy(),
     t=st.lists(time_strategy(), min_size=1, max_size=20),
 )
-@settings(deadline=None, max_examples=100, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=100, verbosity=Verbosity.normal)
 def test_range_always_nonnegative(tx_x0, tx_y, tx_vx, rx_x0, rx_y, rx_vx, fc, t):
     """
     Property: Range r must always be >= 0.
@@ -93,7 +93,7 @@ def test_range_always_nonnegative(tx_x0, tx_y, tx_vx, rx_x0, rx_y, rx_vx, fc, t)
     fc=carrier_freq_strategy(),
     t=st.lists(time_strategy(), min_size=1, max_size=20),
 )
-@settings(deadline=None, max_examples=100, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=100, verbosity=Verbosity.normal)
 def test_radial_velocity_zero_when_no_relative_motion(
     tx_x0, tx_y, rx_x0, rx_y, common_vx, fc, t
 ):
@@ -141,7 +141,7 @@ def test_radial_velocity_zero_when_no_relative_motion(
     fc=carrier_freq_strategy(),
     t=st.lists(time_strategy(), min_size=1, max_size=20),
 )
-@settings(deadline=None, max_examples=100, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=100, verbosity=Verbosity.normal)
 def test_doppler_zero_when_no_relative_motion(
     tx_x0, tx_y, rx_x0, rx_y, common_vx, fc, t
 ):
@@ -190,7 +190,7 @@ def test_doppler_zero_when_no_relative_motion(
     fc=carrier_freq_strategy(),
     t=st.lists(time_strategy(), min_size=1, max_size=20),
 )
-@settings(deadline=None, max_examples=100, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=100, verbosity=Verbosity.normal)
 def test_doppler_formula_consistency(
     tx_x0, tx_y, tx_vx, rx_x0, rx_y, rx_vx, fc, t
 ):
@@ -239,7 +239,7 @@ def test_doppler_formula_consistency(
     rx_vx=velocities_strategy(),
     fc=carrier_freq_strategy(),
 )
-@settings(deadline=None, max_examples=100, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=100, verbosity=Verbosity.normal)
 def test_range_monotonic_when_receding(
     tx_x0, tx_y, tx_vx, rx_x0, rx_y, rx_vx, fc
 ):
@@ -268,14 +268,13 @@ def test_range_monotonic_when_receding(
     # Calculate relative velocity at start
     vdx = cfg.tx_vx - cfg.rx_vx
     
-    # If moving apart (positive relative velocity in direction of separation)
-    # Check that r_dot has correct sign
-    if vdx > 0 and tx_x0 > rx_x0:
-        # Expect positive r_dot (moving apart)
-        assert np.all(result["r_dot"] >= -1e-10), "Should have positive r_dot when moving apart"
-    elif vdx < 0 and tx_x0 < rx_x0:
-        # Expect negative r_dot (moving closer)
-        assert np.all(result["r_dot"] <= 1e-10), "Should have negative r_dot when approaching"
+    # At t=0, r_dot sign follows dx * vdx. Positive means moving apart.
+    initial_dx = tx_x0 - rx_x0
+    expected = initial_dx * vdx
+    if expected > 0:
+        assert result["r_dot"][0] >= -1e-10, "Should have positive r_dot when moving apart"
+    elif expected < 0:
+        assert result["r_dot"][0] <= 1e-10, "Should have negative r_dot when approaching"
 
 
 # =============================================================================
@@ -292,7 +291,7 @@ def test_range_monotonic_when_receding(
     fc=carrier_freq_strategy(),
     t=st.lists(time_strategy(), min_size=1, max_size=50),
 )
-@settings(deadline=None, max_examples=100, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=100, verbosity=Verbosity.normal)
 def test_output_shapes_match_input(
     tx_x0, tx_y, tx_vx, rx_x0, rx_y, rx_vx, fc, t
 ):
@@ -333,7 +332,7 @@ def test_output_shapes_match_input(
     fc=carrier_freq_strategy(),
     lateral_offset=st.floats(min_value=1.0, max_value=1000.0, allow_nan=False, allow_infinity=False),
 )
-@settings(deadline=None, max_examples=100, verbosity=verbosity.normal)
+@settings(deadline=None, max_examples=100, verbosity=Verbosity.normal)
 def test_handles_large_lateral_offsets(
     tx_x0, tx_vx, rx_x0, rx_vx, fc, lateral_offset
 ):

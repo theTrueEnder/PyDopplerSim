@@ -2,3 +2,4 @@
 /__pycache__
 /.venv
 /tests/__pycache__
+/.hypothesis

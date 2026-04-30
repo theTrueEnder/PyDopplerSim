@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from estimation import _hann_smooth, estimate_doppler_phase_diff, estimate_doppler_stft
+from plotting import _mask_phase_diff_edges
 
 
 class TestHannSmooth:
@@ -137,8 +138,10 @@ class TestSTFTEstimation:
         hop_dur = 0.005
         result = estimate_doppler_stft(iq, fs, window_dur=window_dur, hop_dur=hop_dur)
 
-        n_fft = int(window_dur * fs) * 4
-        n_frames = (n_samples - int(window_dur * fs)) // int(hop_dur * fs) + 1
+        win_samp = min(int(window_dur * fs), n_samples)
+        hop_samp = min(int(hop_dur * fs), win_samp)
+        n_fft = win_samp * 4 + 1
+        n_frames = (n_samples - win_samp) // hop_samp + 1
 
         assert result["Sxx"].shape[0] == n_fft
         assert result["Sxx"].shape[1] == n_frames
@@ -176,7 +179,7 @@ class TestWithFixtures:
         n_samples = 5000
         t = np.arange(n_samples) / fs
         iq = np.exp(1j * 2 * np.pi * f_signal * t)
-        noise = (rng.randn(n_samples) + 1j * rng.randn(n_samples)) * 0.01
+        noise = (rng.normal(size=n_samples) + 1j * rng.normal(size=n_samples)) * 0.01
         iq_noisy = iq + noise
 
         _, delta_f = estimate_doppler_phase_diff(iq_noisy, fs, smooth_window=101)
@@ -191,3 +194,18 @@ class TestWithFixtures:
         result = estimate_doppler_stft(iq, fs, window_dur=0.01, hop_dur=0.005)
         assert result["t"] is not None
         assert len(result["peak_freq"]) > 0
+
+
+class TestPhaseDiffPlotMask:
+    """Tests for display masking of phase-diff smoothing edges."""
+
+    def test_masks_phase_diff_smoother_edges(self):
+        t = np.arange(10, dtype=float)
+        delta_f = np.arange(10, dtype=float)
+
+        t_plot, df_plot = _mask_phase_diff_edges(t, delta_f, smooth_window=5)
+
+        np.testing.assert_array_equal(t_plot, t)
+        assert np.all(np.isnan(df_plot[:2]))
+        assert np.all(np.isnan(df_plot[-2:]))
+        np.testing.assert_allclose(df_plot[2:-2], delta_f[2:-2])

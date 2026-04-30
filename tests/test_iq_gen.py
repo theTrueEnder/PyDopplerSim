@@ -124,7 +124,7 @@ class TestSaveLoadIQWav:
         cfg.snr_db = 100  # High SNR for accurate comparison
 
         result = generate_iq(cfg)
-        original_iq = result["iq"]
+        original_iq = result["iq_clean"]
         original_t = result["t"]
 
         wav_path = temp_wav_dir / "test_restore.wav"
@@ -135,8 +135,8 @@ class TestSaveLoadIQWav:
         # Check time array
         np.testing.assert_allclose(loaded_t, original_t, rtol=1e-10)
 
-        # Check IQ data within tolerance < 1e-6
-        np.testing.assert_allclose(loaded_iq, original_iq, atol=1e-6)
+        # 16-bit WAV quantization limits roundtrip precision.
+        np.testing.assert_allclose(loaded_iq, original_iq, atol=5e-5)
 
     def test_load_iq_wav_metadata(self, scenario_oncoming_cfg, temp_wav_dir):
         """Test that metadata is correctly saved and loaded."""
@@ -182,7 +182,7 @@ class TestSaveLoadIQWav:
             )
 
             result = generate_iq(cfg)
-            original_iq = result["iq"]
+            original_iq = result["iq_clean"]
 
             wav_path = temp_wav_dir / f"test_dur_{duration}.wav"
             save_iq_wav(original_iq, result["t"], wav_path, cfg)
@@ -193,7 +193,7 @@ class TestSaveLoadIQWav:
             assert len(loaded_iq) == len(original_iq)
 
             # Verify data within tolerance
-            np.testing.assert_allclose(loaded_iq, original_iq, atol=1e-6)
+            np.testing.assert_allclose(loaded_iq, original_iq, atol=5e-5)
 
     def test_iqmeta_file_created(self, scenario_oncoming_cfg, temp_wav_dir):
         """Test that companion .iqmeta file is created."""
@@ -225,5 +225,9 @@ class TestSaveLoadIQWav:
             i_first = data[0] / 32767.0
             q_first = data[1] / 32767.0
 
-            np.testing.assert_allclose(i_first, result["iq"].real[0], atol=0.001)
-            np.testing.assert_allclose(q_first, result["iq"].imag[0], atol=0.001)
+            np.testing.assert_allclose(
+                i_first, np.clip(result["iq"].real[0], -1.0, 1.0), atol=0.001
+            )
+            np.testing.assert_allclose(
+                q_first, np.clip(result["iq"].imag[0], -1.0, 1.0), atol=0.001
+            )
